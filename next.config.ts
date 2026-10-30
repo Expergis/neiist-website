@@ -6,6 +6,7 @@ const nextConfig: NextConfig = {
   cacheComponents: true,
   devIndicators: false,
   typedRoutes: true,
+  serverExternalPackages: ["@opentelemetry/sdk-node", "pg", "pino"],
   experimental: {
     typedEnv: true,
     optimizePackageImports: [

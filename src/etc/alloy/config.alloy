@@ -1,0 +1,134 @@
+// ═══════════════════════════════════════════════════════════
+// OTLP Receiver — accepts traces and metrics from Next.js
+// ═══════════════════════════════════════════════════════════
+
+otelcol.receiver.otlp "nextjs" {
+  grpc {
+    endpoint = "127.0.0.1:4317"
+  }
+
+  output {
+    traces  = [otelcol.processor.tail_sampling.neiist.input]
+    metrics = [otelcol.processor.batch.metrics.input]
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Tail Sampling — keep errors, slow requests, and 10% sample
+// ═══════════════════════════════════════════════════════════
+
+otelcol.processor.tail_sampling "neiist" {
+  // How long to wait for all spans of a trace before deciding.
+  // 10s is generous enough for our pg queries and Fénix API calls.
+  decision_wait = "10s"
+
+  // Maximum number of in-flight traces held in memory.
+  // For a student association website, 10 000 is plenty.
+  num_traces = 10000
+
+  // Policy 1: Always keep traces that contain an error status
+  // This captures 5xx responses, thrown exceptions, and failed DB queries.
+  policy {
+    name = "keep-errors"
+    type = "status_code"
+
+    status_code {
+      status_codes = ["ERROR"]
+    }
+  }
+
+  // Policy 2: Always keep traces slower than 1 second
+  // These are likely slow DB queries, Fénix API timeouts, or N+1 issues.
+  policy {
+    name = "keep-slow"
+    type = "latency"
+
+    latency {
+      threshold_ms = 1000
+    }
+  }
+
+  // Policy 3: Keep 10% of normal (non-error, fast) traces
+  // This gives representative baseline data without overwhelming Tempo.
+  policy {
+    name = "sample-normal"
+    type = "probabilistic"
+
+    probabilistic {
+      sampling_percentage = 10.0
+    }
+  }
+
+  output {
+    traces = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Batch processor for metrics (pass-through with batching)
+// ═══════════════════════════════════════════════════════════
+
+otelcol.processor.batch "metrics" {
+  output {
+    metrics = [otelcol.exporter.otlp.tempo.input]
+    // If you have a separate Mimir/Prometheus endpoint, route metrics there instead:
+    // metrics = [otelcol.exporter.otlp.mimir.input]
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Exporter — push sampled traces (and metrics) to Tempo
+// ═══════════════════════════════════════════════════════════
+
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"      // Adjust to your Tempo address
+    tls {
+      insecure = true            // Use TLS in production if Tempo is remote
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Loki Pipeline — extract trace context from JSON logs
+// ═══════════════════════════════════════════════════════════
+//
+// If you already have a `loki.process "pm2_pipeline"` block,
+// ADD these stages to it. The stage.json and stage.structured_metadata
+// blocks should come AFTER your existing label extraction stages.
+
+loki.process "pm2_pipeline" {
+  // ... (your existing stages here, if any) ...
+
+  // Extract OTel trace context and route from the JSON log line
+  stage.json {
+    expressions = {
+      trace_id = "trace_id",
+      span_id  = "span_id",
+      route    = "route",
+      level    = "level",
+    }
+  }
+
+  // Set log level as a Loki label (low-cardinality, safe to index)
+  stage.labels {
+    values = {
+      level = "",
+    }
+  }
+
+  // Attach trace_id, span_id, and route as Loki structured metadata.
+  // Structured metadata is NOT indexed as a label (which would be
+  // extremely expensive for high-cardinality fields like trace_id),
+  // but IS queryable and visible in Grafana's log detail panel.
+  // This is what enables the "click log → jump to trace" feature.
+  stage.structured_metadata {
+    values = {
+      trace_id = "",
+      span_id  = "",
+      route    = "",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
